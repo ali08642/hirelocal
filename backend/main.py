@@ -103,21 +103,64 @@ def _normalize_provider(provider):
     """Normalize a provider object with consistent fields and formats."""
     if not isinstance(provider, dict) or not provider.get('name'):
         return None
-        
-    # Normalize phone format
-    phone = provider.get('phone', '')
-    if not re.match(r'\d{3}-\d{3}-\d{4}', str(phone)):
-        digits = re.findall(r'\d', str(phone))
-        phone = 'XXX-XXX-XXXX' if len(digits) < 10 else f"{digits[:3]}-{digits[3:6]}-{digits[6:10]}"
     
-    return {
+    # FIXED: Indian phone number normalization specifically
+    phone = provider.get('phone', '').strip()
+    normalized_phone = ''
+    
+    if phone:
+        # Extract only digits from phone number
+        digits = re.findall(r'\d', str(phone))
+        digit_count = len(digits)
+        all_digits = ''.join(digits)
+        
+        print(f"[PHONE] Processing '{phone}' -> {digit_count} digits: {all_digits}")
+        
+        # Indian mobile number patterns
+        if digit_count == 10 and all_digits[0] in ['6', '7', '8', '9']:
+            # Standard Indian mobile: 9876543210 -> 98765-43210
+            normalized_phone = f"{all_digits[0:5]}-{all_digits[5:10]}"
+            print(f"[PHONE] Indian 10-digit mobile '{phone}' -> '{normalized_phone}'")
+            
+        elif digit_count == 11 and all_digits[0] == '0' and all_digits[1] in ['6', '7', '8', '9']:
+            # Indian mobile with leading 0: 09876543210 -> 98765-43210
+            clean_digits = all_digits[1:]  # Remove leading 0
+            normalized_phone = f"{clean_digits[0:5]}-{clean_digits[5:10]}"
+            print(f"[PHONE] Indian 11-digit mobile '{phone}' -> '{normalized_phone}'")
+            
+        elif digit_count == 12 and all_digits[0:2] == '91':
+            # Indian international: +919876543210 -> 98765-43210
+            clean_digits = all_digits[2:]  # Remove country code
+            normalized_phone = f"{clean_digits[0:5]}-{clean_digits[5:10]}"
+            print(f"[PHONE] Indian international '{phone}' -> '{normalized_phone}'")
+            
+        elif digit_count >= 10:
+            # Fallback: take last 10 digits and format as Indian mobile
+            last_ten = all_digits[-10:]
+            if last_ten[0] in ['6', '7', '8', '9']:
+                normalized_phone = f"{last_ten[0:5]}-{last_ten[5:10]}"
+                print(f"[PHONE] Fallback Indian format '{phone}' -> '{normalized_phone}'")
+            else:
+                normalized_phone = 'XXXXX-XXXXX'
+                print(f"[PHONE] Invalid Indian mobile '{phone}' -> using default")
+        else:
+            normalized_phone = 'XXXXX-XXXXX'
+            print(f"[PHONE] Too few digits '{phone}' ({digit_count}) -> using default")
+    else:
+        normalized_phone = 'XXXXX-XXXXX'
+        print(f"[PHONE] Missing phone for provider '{provider.get('name')}' -> using default")
+    
+    normalized = {
         'name': str(provider.get('name', '')).strip(),
-        'phone': phone,
+        'phone': normalized_phone,  # FIXED: Always include normalized phone
         'details': str(provider.get('details', 'No details available')).strip(),
         'address': str(provider.get('address', 'Address not provided')).strip(),
         'location_note': str(provider.get('location_note', 'NEARBY')).upper(),
         'confidence': str(provider.get('confidence', 'LOW')).upper()
     }
+    
+    print(f"[NORMALIZE] Provider '{normalized['name']}' normalized with phone: '{normalized['phone']}'")
+    return normalized
 
 def _invoke_model(model_name: str, input_text: str, use_search_tools: bool = False):
     """Invoke model with OpenAI->Gemini fallback."""
@@ -156,7 +199,9 @@ def _invoke_model(model_name: str, input_text: str, use_search_tools: bool = Fal
         print(f"[GEMINI] Input prompt: {provider_prompt[:200]}...")
 
         # Use same prompt for Gemini
-        gemini_text = provider_prompt        # Call Gemini API
+        gemini_text = provider_prompt
+        
+        # Call Gemini API
         headers = {
             'Content-Type': 'application/json',
             'X-goog-api-key': GEMINI_API_KEY
@@ -244,25 +289,36 @@ class NlpResponse(BaseModel):
 async def chat_endpoint(request: ChatRequest):
     """Process chat requests and return business providers."""
     try:
-        # Format the prompt with request parameters
+        # ENHANCED: Specific prompt for Indian phone numbers
         prompt = f'''Find the top {request.count} "{request.service}" specialists in "{request.location}".
+
+CRITICAL: Always include valid Indian mobile phone numbers in the format XXXXX-XXXXX (10 digits starting with 6, 7, 8, or 9).
+
+Examples of correct Indian phone formats:
+- 98765-43210
+- 90123-45678  
+- 81234-56789
+
 If exact matches are not found, expand outward to the nearest areas and add a field "location_note": "NEARBY".
 If information is sparse, still include it but mark with "confidence": "LOW".
+
 Return ONLY valid JSON in this format:
 
 [
   {{
-    "name": "...",
-    "phone": "...",
-    "details": "...",
-    "address": "...",
+    "name": "Business Name",
+    "phone": "XXXXX-XXXXX",
+    "details": "Service description", 
+    "address": "Full address with city, state",
     "location_note": "EXACT or NEARBY",
     "confidence": "HIGH or LOW"
   }}
 ]
+
+IMPORTANT: Every provider MUST have a "phone" field with a real Indian mobile number in XXXXX-XXXXX format.
 No extra commentary, only JSON.'''
 
-        print(f"[DEBUG] Formatted prompt: {prompt[:200]}...")
+        print(f"[DEBUG] Enhanced prompt for phone numbers: {prompt[:300]}...")
 
         # Get providers with error handling
         try:
@@ -309,11 +365,16 @@ No extra commentary, only JSON.'''
                     detail="Invalid response format from model"
                 )
 
-            # Process providers with duplicate detection
+            # ENHANCED: Process providers with better phone handling and logging
             providers = []
             seen = set(name.lower().strip() for name in (request.existing or []))
             
-            for provider in data:
+            print(f"[PROCESSING] Raw data from model: {json.dumps(data, indent=2)}")
+            
+            for i, provider in enumerate(data):
+                print(f"[PROVIDER {i}] Processing: {provider.get('name', 'Unknown')}")
+                print(f"[PROVIDER {i}] Raw phone: '{provider.get('phone', 'MISSING')}'")
+                
                 try:
                     normalized = _normalize_provider(provider)
                     if normalized:
@@ -321,8 +382,17 @@ No extra commentary, only JSON.'''
                         if name not in seen:
                             providers.append(normalized)
                             seen.add(name)
+                            print(f"[PROVIDER {i}] Added with phone: '{normalized['phone']}'")
+                        else:
+                            print(f"[PROVIDER {i}] Skipped - duplicate name: '{name}'")
+                    else:
+                        print(f"[PROVIDER {i}] Skipped - normalization failed")
                 except Exception as e:
-                    print(f"[WARNING] Failed to normalize provider: {str(e)}")
+                    print(f"[WARNING] Failed to normalize provider {i}: {str(e)}")
+
+            print(f"[FINAL] Returning {len(providers)} providers")
+            for i, p in enumerate(providers):
+                print(f"[FINAL {i}] {p['name']} - Phone: {p['phone']}")
 
             # Calculate usage metrics and costs
             usage_info = _get_usage_info(response)
@@ -351,8 +421,15 @@ No extra commentary, only JSON.'''
             }
 
             print(f"[INFO] Found {len(providers)} providers, returning top {request.count}")
+            final_providers = providers[:request.count]
+            
+            # FINAL CHECK: Log what we're actually returning
+            print("[RESPONSE] Final provider data being returned:")
+            for i, provider in enumerate(final_providers):
+                print(f"  {i+1}. {provider['name']} - {provider['phone']}")
+            
             return ChatResponse(
-                providers=providers[:request.count],
+                providers=final_providers,
                 usage_report=usage_report
             )
 
@@ -413,30 +490,33 @@ async def nlp_endpoint(request: NlpRequest):
             print(f"[ERROR] Query validation failed: {str(e)}")
             return NlpResponse(valid=False)
 
-        # Extract service info
+        # ENHANCED: Extract service info with explicit phone requirements
         extraction_prompt = (
             f'From this service request: "{request.query}"\n\n'
             'Extract the service type, location, and find relevant providers (default 3).\n\n'
-            'Use web search to find REAL service providers. Return ONLY valid JSON:\n'
-            '{\n'
+            'CRITICAL: Use web search to find REAL service providers with REAL phone numbers.\n'
+            'Every provider MUST have a working phone number.\n\n'
+            'Return ONLY valid JSON:\n'
+            '{{\n'
             '  "service": "extracted service type",\n'
             '  "location": "extracted location or \'not specified\'",\n'
             '  "count": 3,\n'
             '  "providers": [\n'
-            '    {\n'
+            '    {{\n'
             '      "name": "real business name",\n'
-            '      "phone": "XXX-XXX-XXXX format",\n'
+            '      "phone": "XXX-XXX-XXXX format (REQUIRED)",\n'
             '      "details": "brief description",\n'
             '      "address": "full address",\n'
             '      "location_note": "EXACT or NEARBY",\n'
             '      "confidence": "HIGH or LOW"\n'
-            '    }\n'
+            '    }}\n'
             '  ]\n'
-            '}\n\n'
+            '}}\n\n'
             'Guidelines:\n'
             '- Search in provided location first\n'
             '- If no location specified, search broadly\n'
             '- Include country-specific results for non-US locations\n'
+            '- MUST include valid phone numbers for all providers\n'
             '- Return clean JSON only, no commentary'
         )
 
@@ -450,16 +530,28 @@ async def nlp_endpoint(request: NlpRequest):
             if not text:
                 return NlpResponse(valid=False)
 
+            print(f"[NLP] Raw extraction response: {text[:500]}...")
+
             # Parse and normalize response
             text = re.sub(r'```json\s*|\s*```|`', '', text.strip())
             data = json.loads(text)
 
-            # Process providers
+            print(f"[NLP] Parsed extraction data: {json.dumps(data, indent=2)}")
+
+            # ENHANCED: Process providers with phone validation
             providers = []
-            for provider in data.get('providers', []):
+            raw_providers = data.get('providers', [])
+            
+            print(f"[NLP] Processing {len(raw_providers)} raw providers...")
+            
+            for i, provider in enumerate(raw_providers):
+                print(f"[NLP PROVIDER {i}] Raw: {provider}")
                 normalized = _normalize_provider(provider)
                 if normalized:
                     providers.append(normalized)
+                    print(f"[NLP PROVIDER {i}] Normalized phone: {normalized['phone']}")
+                else:
+                    print(f"[NLP PROVIDER {i}] Failed normalization")
 
             # Calculate usage and costs
             usage_info = _get_usage_info(response)
@@ -477,6 +569,7 @@ async def nlp_endpoint(request: NlpRequest):
                 "estimated_cost_usd": round(cost, 6)
             }
 
+            print(f"[NLP FINAL] Returning {len(providers)} providers with phones")
             return NlpResponse(
                 valid=True,
                 providers=providers,

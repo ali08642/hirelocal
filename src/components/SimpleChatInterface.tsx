@@ -10,6 +10,21 @@ interface Message {
   content: string;
   timestamp: Date;
   providers?: ServiceProvider[];
+  businesses?: Business[];
+}
+
+// FIXED: Added complete ServiceProvider interface
+interface ServiceProvider {
+  id?: string;
+  name: string;
+  phone?: string;
+  details?: string;
+  address: string;
+  location_note?: string;
+  confidence?: string;
+  website?: string;
+  rating?: string;
+  reviews?: number;
 }
 
 import { Business } from '../types/firebase';
@@ -42,6 +57,37 @@ const SimpleChatInterface: React.FC = () => {
   const [isInitializing, setIsInitializing] = useState(true);
   const [businesses, setBusinesses] = useState<Business[]>([]);
   const { user } = useAuth();
+
+// FIXED: Added proper provider to business mapping function
+const mapProviderToBusiness = (provider: ServiceProvider, service: string): Business => {
+  console.log('[MAPPING] Converting provider to business:', {
+    name: provider.name,
+    phone: provider.phone,
+    address: provider.address,
+    website: provider.website,
+    rating: provider.rating,
+    reviews: provider.reviews
+  });
+  
+  return {
+    id: provider.id || Math.random().toString(),
+    name: provider.name,
+    description: provider.details || '',
+    category: service,
+    services: [],
+    location: {
+      address: provider.address,
+      city: '',
+      state: '',
+      zip: ''
+    },
+    phone: provider.phone || '', // FIXED: Map phone field
+    website: provider.website || '',
+    rating: provider.rating || '',
+    reviews: provider.reviews || 0,
+    saved: false
+  };
+};
 
 const handleToggleSave = async (businessId: string) => {
   if (!user) return;
@@ -770,7 +816,7 @@ const loadSavedStatus = useCallback(async () => {
 
   // Extract structured data for /api/chat endpoint
   const extractStructuredData = (query: string) => {
-    console.log('🔍 Extracting from query:', query);
+    console.log('Extracting from query:', query);
     
     // Extract service - be more flexible and dynamic
     let service = '';
@@ -802,7 +848,7 @@ const loadSavedStatus = useCallback(async () => {
         // Intelligent service cleaning - remove common noise words
         service = service.replace(/\b(local|some|good|best|reliable|professional)\b/gi, '').trim();
         
-        console.log(`✅ Extracted service via ${pattern.desc}:`, service);
+        console.log(`Extracted service via ${pattern.desc}:`, service);
         patternMatched = true;
         break;
       }
@@ -816,7 +862,7 @@ const loadSavedStatus = useCallback(async () => {
     const serviceLocationMatch = query.match(serviceWithLocationPattern.regex);
     if (serviceLocationMatch && serviceLocationMatch[2]) {
       location = serviceLocationMatch[2].trim();
-      console.log('✅ Extracted location via service pattern:', location);
+      console.log('Extracted location via service pattern:', location);
     } else {
       // Modern location patterns - prioritized by specificity
       const locationPatterns = [
@@ -838,11 +884,11 @@ const loadSavedStatus = useCallback(async () => {
         const match = query.match(pattern.regex);
         if (match && match[1]) {
           location = match[1].trim();
-          console.log(`✅ Extracted location via ${pattern.desc}:`, location);
+          console.log(`Extracted location via ${pattern.desc}:`, location);
           break;
         } else if (pattern.desc === 'near me' && match) {
           location = 'near me';
-          console.log(`✅ Extracted location: ${match[0]}`);
+          console.log(`Extracted location: ${match[0]}`);
           break;
         }
       }
@@ -851,7 +897,7 @@ const loadSavedStatus = useCallback(async () => {
     // Post-process location to handle context-specific terms
     if (location === 'my area' || location === 'near me') {
       // Replace with actual user location if available
-      console.log('🔍 Processing "near me" - userLocation:', userLocation);
+      console.log('Processing "near me" - userLocation:', userLocation);
       if (userLocation) {
         const locationParts = [];
         if (userLocation.area) locationParts.push(userLocation.area);
@@ -859,9 +905,9 @@ const loadSavedStatus = useCallback(async () => {
         if (userLocation.state) locationParts.push(userLocation.state);
         if (userLocation.country && userLocation.country !== 'unknown') locationParts.push(userLocation.country);
         location = locationParts.join(', ');
-        console.log('✅ Replaced "near me" with actual location:', location);
+        console.log('Replaced "near me" with actual location:', location);
       } else {
-        console.log('⚠️ "near me" detected but no userLocation available');
+        console.log('"near me" detected but no userLocation available');
       }
     }
     
@@ -873,10 +919,10 @@ const loadSavedStatus = useCallback(async () => {
       if (userLocation.state) locationParts.push(userLocation.state);
       if (userLocation.country && userLocation.country !== 'unknown') locationParts.push(userLocation.country);
       location = locationParts.join(', ');
-      console.log('🔄 Fallback: Used userLocation as location context:', location);
+      console.log('Fallback: Used userLocation as location context:', location);
     }
     
-    console.log('🎯 Final extraction:', { service, location });
+    console.log('Final extraction:', { service, location });
     return { service, location };
   };
 
@@ -1009,8 +1055,7 @@ const loadSavedStatus = useCallback(async () => {
       } else {
         addMessage('ai', "I specialize in connecting you with local service providers. Try asking something like 'I need an electrician in [your city]' or 'find a plumber near me'. What service are you looking for?");
       }
-  // keep quick replies hidden — user already engaged
-  setShowQuickReplies(false);
+      setShowQuickReplies(false);
       return;
     }
     
@@ -1054,7 +1099,7 @@ const loadSavedStatus = useCallback(async () => {
         }
       }
       
-      console.log('🔍 Service extracted from user input:', { originalQuery: query, extractedService: service });
+      console.log('Service extracted from user input:', { originalQuery: query, extractedService: service });
       setSelectedService(service);
       
       // If we have user's location from previous interaction, auto-proceed with search
@@ -1075,7 +1120,7 @@ const loadSavedStatus = useCallback(async () => {
           queryPrefix = `I need a local ${service} ${locationText}. Please find service providers specifically in ${userLocation.country}`;
         }
         
-        console.log('🔍 Auto-searching with service + location:', { service, userLocation, queryPrefix });
+        console.log('Auto-searching with service + location:', { service, userLocation, queryPrefix });
         addMessage('ai', `Perfect! Let me find ${service}s in ${userLocation.area}${userLocation.city !== userLocation.area ? `, ${userLocation.city}` : ''}.`);
         setConversationState('complete');
         setTimeout(() => handleNlpSubmit(queryPrefix), 500);
@@ -1088,12 +1133,9 @@ const loadSavedStatus = useCallback(async () => {
       return;
     }
 
-  setNlpInput('');
-  // hide quick replies once user starts a search; they'll re-appear only after first search completes or on guidance
-  setShowQuickReplies(false);
+    setNlpInput('');
+    setShowQuickReplies(false);
     setSelectedService('');
-    // Don't clear selectedLocation or userLocation - preserve location context
-    // setSelectedLocation('');
     addMessage('user', query);
     setIsLoading(true);
     setIsTyping(true);
@@ -1113,19 +1155,19 @@ const loadSavedStatus = useCallback(async () => {
       
       // Check if we can extract structured data for /api/chat
       const structuredData = extractStructuredData(queryToProcess);
-      console.log('🔍 Query processing:', { queryToProcess, structuredData });
+      console.log('Query processing:', { queryToProcess, structuredData });
       
       if (structuredData.service && structuredData.location) {
         try {
           // Use /api/chat for structured queries
-          console.log('✅ Using /api/chat with structured data:', {
+          console.log('Using /api/chat with structured data:', {
             service: structuredData.service,
             location: structuredData.location,
             count: 3
           });
 
           const baseUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000';
-          console.log('🌐 Sending request to:', `${baseUrl}/api/chat`);
+          console.log('Sending request to:', `${baseUrl}/api/chat`);
 
           response = await fetch(`${baseUrl}/api/chat`, {
             method: 'POST',
@@ -1143,7 +1185,7 @@ const loadSavedStatus = useCallback(async () => {
 
           if (!response.ok) {
             const text = await response.text();
-            console.error('🔴 Server response:', text);
+            console.error('Server response:', text);
             throw new Error(`HTTP error! status: ${response.status}`);
           }
 
@@ -1152,7 +1194,7 @@ const loadSavedStatus = useCallback(async () => {
             throw new TypeError("Oops, we haven't got JSON!");
           }
         } catch (error) {
-          console.error('🔴 API request failed:', error);
+          console.error('API request failed:', error);
           // Add user-friendly error message
           setMessages(prev => [
             ...prev,
@@ -1174,7 +1216,7 @@ const loadSavedStatus = useCallback(async () => {
         };
       } else {
         // Use /api/nlp for natural language queries
-        console.log('⚠️ Using /api/nlp with query:', queryToProcess);
+        console.log('Using /api/nlp with query:', queryToProcess);
         response = await fetch('http://localhost:8000/api/nlp', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1191,58 +1233,37 @@ const loadSavedStatus = useCallback(async () => {
       processingTimeoutsRef.current = [];
       setIsTyping(false);
       
-      console.log('📊 API Response:', data);
+      console.log('API Response:', data);
       
       // Handle different response cases
       if (!data.valid) {
         // Case C: Invalid Query
         addMessage('ai', "I can only help with finding local services. Please try asking again with a service and location, like 'find an electrician near me'.");
         setConversationState('initial');
-  setShowQuickReplies(true);
-  } else if (data.providers && data.providers.length > 0) {
+        setShowQuickReplies(true);
+      } else if (data.providers && data.providers.length > 0) {
         // Case A: Success with providers
         const location = queryToProcess.match(/in\s+([^,.!?]+)|near\s+([^,.!?]+)|near me/i)?.[0] || 'your area';
         const serviceMatch = queryToProcess.match(/(?:need|find|looking for)\s+(?:a|an)?\s*([^in]+?)(?:\s+in|\s+near|$)/i);
         const service = serviceMatch?.[1]?.trim() || 'service providers';
         
+        // FIXED: Use mapping function to ensure phone is included
+        const businesses: Business[] = data.providers.map((provider: ServiceProvider) => 
+          mapProviderToBusiness(provider, service)
+        );
+        
+        console.log('[SUCCESS] Mapped businesses with phones:', 
+          businesses.map(b => ({ name: b.name, phone: b.phone }))
+        );
+        
         // More natural success message
         if (validation.isLocationResponse) {
-          const businesses: Business[] = data.providers.map(provider => ({
-            id: provider.id || Math.random().toString(),
-            name: provider.name,
-            description: provider.details || '',
-            category: service,
-            services: [],
-            location: {
-              address: provider.address,
-              city: '',
-              state: '',
-              zip: ''
-            },
-            saved: false
-          }));
-
           addMessage('ai', `Perfect! I found ${businesses.length} ${service}${businesses.length === 1 ? '' : 's'} ${location}. Here are your options:`, { businesses });
         } else {
-          const businesses: Business[] = data.providers.map(provider => ({
-            id: provider.id || Math.random().toString(),
-            name: provider.name,
-            description: provider.details || '',
-            category: service,
-            services: [],
-            location: {
-              address: provider.address,
-              city: '',
-              state: '',
-              zip: ''
-            },
-            saved: false
-          }));
-
           addMessage('ai', `Great! I found ${businesses.length} ${service}${businesses.length === 1 ? '' : 's'} ${location}. Here are the top matches:`, { businesses });
         }
         
-  setConversationState('complete');
+        setConversationState('complete');
       } else {
         // Case B: No results found
         const serviceMatch = queryToProcess.match(/(?:need|find|looking for)\s+(?:a|an)?\s*([^in]+?)(?:\s+in|\s+near|$)/i);
@@ -1252,7 +1273,7 @@ const loadSavedStatus = useCallback(async () => {
         
         addMessage('ai', `I searched for ${service} in ${location} but couldn't find any specific listings. Would you like to try a broader search or a different service?`);
         setConversationState('initial');
-  setShowQuickReplies(true);
+        setShowQuickReplies(true);
       }
     } catch (error) {
       setIsTyping(false);
@@ -1339,7 +1360,7 @@ const loadSavedStatus = useCallback(async () => {
           }
           
           setIsInitializing(false);
-  } catch {
+        } catch {
           console.log('Permission API not supported');
           setLocationPermissionState('asking');
           setIsInitializing(false);
@@ -1556,11 +1577,11 @@ const loadSavedStatus = useCallback(async () => {
       ? "bg-[#161B22] border border-[#30363D] text-[#8B949E] hover:bg-[#21262D] hover:text-[#E6EDF3] hover:border-[#4A80F0]/50 transition-all duration-200"
       : "bg-white border border-gray-200 text-gray-700 hover:bg-gray-50 hover:text-gray-900 transition-all duration-200",
     providerCard: isDark
-  ? "relative group rounded-2xl p-[1.5px] bg-gradient-to-br from-blue-500/30 via-blue-400/10 to-transparent shadow-[0_4px_18px_-4px_rgba(0,0,0,0.6)] hover:shadow-[0_6px_28px_-4px_rgba(0,0,0,0.7)] transition-all duration-300"
-  : "relative group rounded-2xl p-[1.5px] bg-gradient-to-br from-blue-500/40 via-indigo-300/10 to-transparent shadow-[0_4px_14px_-4px_rgba(0,0,0,0.15)] hover:shadow-[0_8px_28px_-6px_rgba(0,0,0,0.25)] transition-all duration-300",
+      ? "relative group rounded-2xl p-[1.5px] bg-gradient-to-br from-blue-500/30 via-blue-400/10 to-transparent shadow-[0_4px_18px_-4px_rgba(0,0,0,0.6)] hover:shadow-[0_6px_28px_-4px_rgba(0,0,0,0.7)] transition-all duration-300"
+      : "relative group rounded-2xl p-[1.5px] bg-gradient-to-br from-blue-500/40 via-indigo-300/10 to-transparent shadow-[0_4px_14px_-4px_rgba(0,0,0,0.15)] hover:shadow-[0_8px_28px_-6px_rgba(0,0,0,0.25)] transition-all duration-300",
     providerCardInner: isDark
-  ? "rounded-2xl bg-[#161B22]/90 backdrop-blur-xl border border-[#30363D] p-4 min-h-[92px] flex flex-col overflow-hidden"
-  : "rounded-2xl bg-white/90 backdrop-blur-xl border border-gray-200 p-4 min-h-[92px] flex flex-col overflow-hidden",
+      ? "rounded-2xl bg-[#161B22]/90 backdrop-blur-xl border border-[#30363D] p-4 min-h-[92px] flex flex-col overflow-hidden"
+      : "rounded-2xl bg-white/90 backdrop-blur-xl border border-gray-200 p-4 min-h-[92px] flex flex-col overflow-hidden",
     inputArea: isDark
       ? "bg-[#161B22]/80 backdrop-blur-2xl border-t border-[#30363D] shadow-2xl"
       : "bg-white/80 backdrop-blur-2xl border-t border-gray-200 shadow-lg",
@@ -1660,7 +1681,7 @@ const loadSavedStatus = useCallback(async () => {
         ...premiumSpring,
         filter: { duration: 0.3 }
       }
-  }
+    }
   };
 
   const locationChipVariants = {
@@ -1754,7 +1775,7 @@ const loadSavedStatus = useCallback(async () => {
                               variants={providerCardVariants}
                               key={index}
                               data-provider-index={index}
-          className={`${themeStyles.providerCard} w-full`}
+                              className={`${themeStyles.providerCard} w-full`}
                               whileHover={{ 
                                 y: -4,
                                 transition: { duration: 0.25 }
@@ -1874,10 +1895,10 @@ const loadSavedStatus = useCallback(async () => {
                                 const userMessages = messages.filter(m => m.type === 'user');
                                 const lastUserQuery = userMessages[userMessages.length - 1]?.content || '';
                                 
-                                console.log('🔍 [VIEW ALL] Debug Info:');
-                                console.log('🔍 [VIEW ALL] All user messages:', userMessages.map(m => m.content));
-                                console.log('🔍 [VIEW ALL] Last user query:', lastUserQuery);
-                                console.log('🔍 [VIEW ALL] Current providers count:', message.providers?.length || 0);
+                                console.log('[VIEW ALL] Debug Info:');
+                                console.log('[VIEW ALL] All user messages:', userMessages.map(m => m.content));
+                                console.log('[VIEW ALL] Last user query:', lastUserQuery);
+                                console.log('[VIEW ALL] Current providers count:', message.providers?.length || 0);
                                 
                                 // Extract service and location from the query with improved patterns
                                 let service = '';
@@ -1918,7 +1939,7 @@ const loadSavedStatus = useCallback(async () => {
                                   }
                                 }
                                 
-                                console.log('🔍 [VIEW ALL] Initial extraction:', { service, location });
+                                console.log('[VIEW ALL] Initial extraction:', { service, location });
                                 
                                 // If location response, get service from earlier messages
                                 if (!service) {
@@ -1931,7 +1952,7 @@ const loadSavedStatus = useCallback(async () => {
                                         service = match[1].trim();
                                         service = service.replace(/\b(local|some|good|best|reliable|professional)\b/gi, '').trim();
                                         if (service) {
-                                          console.log('🔍 [VIEW ALL] Found service from history:', service);
+                                          console.log('[VIEW ALL] Found service from history:', service);
                                           break;
                                         }
                                       }
@@ -1943,16 +1964,16 @@ const loadSavedStatus = useCallback(async () => {
                                 // If location is still empty, check if last query was just a location
                                 if (!location && /^(near|in|at)\s+/i.test(lastUserQuery.trim())) {
                                   location = lastUserQuery.replace(/^(near|in|at)\s+/i, '').trim();
-                                  console.log('🔍 [VIEW ALL] Found location from query:', location);
+                                  console.log('[VIEW ALL] Found location from query:', location);
                                 }
                                 
-                                console.log('🔍 [VIEW ALL] Final extraction:', { service, location });
+                                console.log('[VIEW ALL] Final extraction:', { service, location });
                                 
                                 if (service && location) {
                                   // Show a dynamic loading box in-place while fetching more
                                   setLoadingMore(true);
                                   setLoadingMoreMessage('Loading more providers...');
-                                  console.log('🔍 [VIEW ALL] Starting API call with:', { service, location, count: 10 });
+                                  console.log('[VIEW ALL] Starting API call with:', { service, location, count: 10 });
                                   
                                   try {
                                     // small staged messages to make it feel dynamic
@@ -1962,7 +1983,7 @@ const loadSavedStatus = useCallback(async () => {
 
                                     // Call /api/chat with count=10 requesting more providers, passing existing names for proper dedupe
                                     const existingNames = (message.providers || []).map(p => p.name).filter(Boolean);
-                                    console.log('🔍 [VIEW ALL] Existing names to exclude:', existingNames);
+                                    console.log('[VIEW ALL] Existing names to exclude:', existingNames);
                                     
                                     const apiPayload = { 
                                       service: service, 
@@ -1970,7 +1991,7 @@ const loadSavedStatus = useCallback(async () => {
                                       count: 10,
                                       existing: existingNames
                                     };
-                                    console.log('🔍 [VIEW ALL] API payload:', apiPayload);
+                                    console.log('[VIEW ALL] API payload:', apiPayload);
                                     
                                     const response = await fetch('http://localhost:8000/api/chat', {
                                       method: 'POST',
@@ -1978,27 +1999,22 @@ const loadSavedStatus = useCallback(async () => {
                                       body: JSON.stringify(apiPayload),
                                     });
 
-                                    console.log('🔍 [VIEW ALL] API response status:', response.status);
+                                    console.log('[VIEW ALL] API response status:', response.status);
                                     
                                     if (response.ok) {
                                       const data = await response.json();
-                                      const businesses: Business[] = (data.providers as ServiceProvider[] | undefined)?.map(provider => ({
-                                        id: provider.id || Math.random().toString(),
-                                        name: provider.name,
-                                        description: provider.details || '',
-                                        category: service,
-                                        services: [],
-                                        location: {
-                                          address: provider.address,
-                                          city: '',
-                                          state: '',
-                                          zip: ''
-                                        },
-                                        saved: false
-                                      })) || [];
+                                      
+                                      // FIXED: Use mapping function to ensure phone is included
+                                      const businesses: Business[] = (data.providers as ServiceProvider[] | undefined)?.map(provider => 
+                                        mapProviderToBusiness(provider, service)
+                                      ) || [];
+
+                                      console.log('[VIEW ALL] Mapped businesses with phones:', 
+                                        businesses.map(b => ({ name: b.name, phone: b.phone }))
+                                      );
 
                                       const newCount = businesses.length;
-                                      console.log('🔍 [VIEW ALL] API response data:', { 
+                                      console.log('[VIEW ALL] API response data:', { 
                                         providersCount: newCount, 
                                         businesses: businesses.map(b => b.name)
                                       });
@@ -2006,13 +2022,13 @@ const loadSavedStatus = useCallback(async () => {
                                       setLoadingMoreMessage(`Loaded ${newCount} providers successfully`);
                                       // Update businesses in current chat message so user sees expanded list before navigation
                                       if (newCount && newCount > (message.businesses?.length || 0)) {
-                                        console.log('🔍 [VIEW ALL] Updating message businesses from', message.businesses?.length || 0, 'to', newCount);
+                                        console.log('[VIEW ALL] Updating message businesses from', message.businesses?.length || 0, 'to', newCount);
                                         setMessages(prev => prev.map(m => m.id === message.id ? { ...m, businesses } : m));
                                       }
                                       // small delay to let users read the updated list
                                       await new Promise(res => setTimeout(res, 500));
                                       
-                                      console.log('🔍 [VIEW ALL] Navigating to providers page with:', {
+                                      console.log('[VIEW ALL] Navigating to providers page with:', {
                                         providersCount: data.providers?.length || 0,
                                         searchQuery: `${service} in ${location}`,
                                         category: service.charAt(0).toUpperCase() + service.slice(1)
@@ -2027,12 +2043,12 @@ const loadSavedStatus = useCallback(async () => {
                                         }
                                       });
                                     } else {
-                                      console.error('🔍 [VIEW ALL] API response not ok:', response.status, response.statusText);
+                                      console.error('[VIEW ALL] API response not ok:', response.status, response.statusText);
                                       const errorText = await response.text();
-                                      console.error('🔍 [VIEW ALL] API error body:', errorText);
+                                      console.error('[VIEW ALL] API error body:', errorText);
                                       
                                       // Fallback: show existing providers in results screen
-                                      console.log('🔍 [VIEW ALL] Falling back to existing providers');
+                                      console.log('[VIEW ALL] Falling back to existing providers');
                                       navigate('/providers', {
                                         state: {
                                           providers: message.providers,
@@ -2042,7 +2058,7 @@ const loadSavedStatus = useCallback(async () => {
                                       });
                                     }
                                   } catch (error) {
-                                    console.error('🔍 [VIEW ALL] Error fetching more providers:', error);
+                                    console.error('[VIEW ALL] Error fetching more providers:', error);
                                     // Fallback: show existing providers
                                     navigate('/providers', {
                                       state: {
@@ -2058,7 +2074,7 @@ const loadSavedStatus = useCallback(async () => {
                                     processingTimeoutsRef.current = [];
                                   }
                                 } else {
-                                  console.log('🔍 [VIEW ALL] Service or location missing, using fallback');
+                                  console.log('[VIEW ALL] Service or location missing, using fallback');
                                   // Show existing providers if we can't extract service/location
                                   navigate('/providers', {
                                     state: {

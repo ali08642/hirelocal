@@ -59,14 +59,14 @@ export const BusinessService = {
       // Generate unique document ID
       const saveDocRef = doc(collection(db, 'savedBusinesses'));
       
-      // Clean business data to avoid property conflicts
+      // Clean business data to avoid property conflicts - FIXED: Preserve phone
       const cleanBusinessInfo = {
         name: business.name || 'Unnamed Business',
         description: business.description || '',
         category: business.category || 'uncategorized',
         services: business.services || [],
         location: business.location || {},
-        phone: business.phone || '',
+        phone: business.phone || '', // FIXED: Ensure phone is preserved
         website: business.website || '',
         rating: business.rating || '',
         reviews: business.reviews || 0,
@@ -82,7 +82,7 @@ export const BusinessService = {
       // Save to top-level savedBusinesses collection
       await setDoc(saveDocRef, businessData);
       
-      console.log('[BUSINESS] Business saved successfully:', saveDocRef.id);
+      console.log('[BUSINESS] Business saved successfully with phone:', cleanBusinessInfo.phone);
       return saveDocRef.id; // Return the Firebase document ID
     } catch (error) {
       console.error('Error saving business:', error);
@@ -157,26 +157,30 @@ export const BusinessService = {
           businessData = data;
         }
         
-        return {
+        // FIXED: Properly map all fields including phone
+        const business: Business = {
           id: doc.id, // This is the save document ID
           name: businessData.name || '',
           description: businessData.description || '',
           category: businessData.category || '',
           services: businessData.services || [],
           location: {
-            address: businessData.address,
-            city: businessData.city,
-            state: businessData.state,
-            zip: businessData.zip,
-            coordinates: businessData.coordinates
+            address: businessData.location?.address || businessData.address || '',
+            city: businessData.location?.city || businessData.city || '',
+            state: businessData.location?.state || businessData.state || '',
+            zip: businessData.location?.zip || businessData.zip || '',
+            coordinates: businessData.location?.coordinates || businessData.coordinates
           },
           saved: true,
           savedAt: data.savedAt?.toDate?.() || new Date(),
-          phone: businessData.phone || '',
+          phone: businessData.phone || '', // FIXED: Ensure phone is mapped
           website: businessData.website || '',
           rating: businessData.rating || '',
           reviews: businessData.reviews || 0
-        } as Business;
+        };
+
+        console.log('[BUSINESS] Retrieved business with phone:', business.phone);
+        return business;
       });
     } catch (error) {
       console.error('Error getting saved businesses:', error);
@@ -189,7 +193,13 @@ export const BusinessService = {
       const docRef = doc(db, 'businesses', id);
       const docSnap = await getDoc(docRef);
       if (docSnap.exists()) {
-        return { id: docSnap.id, ...docSnap.data() } as Business;
+        const data = docSnap.data();
+        // FIXED: Ensure phone is properly mapped when retrieving by ID
+        return { 
+          id: docSnap.id, 
+          ...data,
+          phone: data.phone || '' // Explicitly map phone field
+        } as Business;
       }
       return null;
     } catch (error) {
@@ -222,15 +232,23 @@ export const BusinessService = {
       
       querySnapshot.forEach((doc) => {
         const data = doc.data();
-        businesses.push({ 
+        // FIXED: Properly map all fields including phone from search results
+        const business: Business = { 
           id: doc.id, 
           name: (data.name as string) || '',
           description: (data.description as string) || '',
           category: (data.category as string) || '',
           services: (data.services as string[]) || [],
           location: (data.location as BusinessLocation) || {},
+          phone: (data.phone as string) || '', // FIXED: Map phone field
+          website: (data.website as string) || '',
+          rating: (data.rating as string) || '',
+          reviews: (data.reviews as number) || 0,
           saved: false
-        } as Business);
+        };
+        
+        businesses.push(business);
+        console.log('[BUSINESS] Search result with phone:', business.phone);
       });
 
       // Client-side filtering for search query
@@ -239,7 +257,8 @@ export const BusinessService = {
         return businesses.filter(business => 
           business.name.toLowerCase().includes(searchQuery) ||
           business.description.toLowerCase().includes(searchQuery) ||
-          business.services.some(service => service.toLowerCase().includes(searchQuery))
+          business.services.some(service => service.toLowerCase().includes(searchQuery)) ||
+          (business.phone && business.phone.toLowerCase().includes(searchQuery)) // FIXED: Include phone in search
         );
       }
 
