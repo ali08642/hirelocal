@@ -1,0 +1,1235 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import json
+import os
+import re
+import requests
+import traceback
+from dotenv import load_dotenv
+from routes.auth_routes import router as auth_router
+from config import client
+
+# Load environment variables from .env file
+load_dotenv(override=True)
+
+app = FastAPI(title="ServiceGPT API", version="1.0.0")
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://localhost:8000"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["*"]
+)
+
+# Import and add security headers middleware
+from middleware.security import SecurityHeadersMiddleware
+app.add_middleware(SecurityHeadersMiddleware)
+
+# Mount the auth routes
+app.include_router(auth_router, prefix="/api")
+
+# Load Gemini configuration for fallback
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '').strip()
+GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.0-flash').strip()
+GEMINI_ENDPOINT = os.getenv('GEMINI_ENDPOINT', '').strip()
+
+# If no endpoint is specified, construct it from the model name
+if not GEMINI_ENDPOINT and GEMINI_MODEL:
+    GEMINI_ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+# Helpers: robustly extract text and usage from varying SDK shapes
+def _get_response_text(resp):
+    try:
+        text = getattr(resp, 'output_text', None)
+        if text:
+            return text
+        out = getattr(resp, 'output', None)
+        if isinstance(out, list) and len(out) > 0:
+            first = out[0]
+            if isinstance(first, dict):
+                # try find common nested fields
+                content = first.get('content')
+                if isinstance(content, list) and len(content) > 0 and isinstance(content[0], dict):
+                    return content[0].get('text') or content[0].get('content') or json.dumps(content)
+                return first.get('text') or json.dumps(first)
+        # fallback to string
+        return str(resp)
+    except Exception:
+        return ''
+
+def _get_usage_info(resp):
+    try:
+        u = getattr(resp, 'usage', None)
+        # try dict-like access
+        if u is None and isinstance(resp, dict):
+            u = resp.get('usage')
+        if not u:
+            return {}
+
+        def _g(o, *names):
+            for n in names:
+                if isinstance(o, dict) and n in o:
+                    return o[n]
+                if hasattr(o, n):
+                    return getattr(o, n)
+            return 0
+
+        input_tokens = _g(u, 'input_tokens', 'prompt_tokens') or 0
+        output_tokens = _g(u, 'output_tokens', 'completion_tokens') or 0
+        total_tokens = (input_tokens or 0) + (output_tokens or 0)
+        return {
+            'model': getattr(resp, 'model', None) or (resp.get('model') if isinstance(resp, dict) else None),
+            'input_tokens': input_tokens,
+            'output_tokens': output_tokens,
+            'total_tokens': total_tokens
+        }
+    except Exception:
+        return {}
+
+# Print configuration
+print(f"[CONFIG] OpenAI API KEY present: {bool(client.api_key)}")
+print(f"[CONFIG] Gemini Fallback Configuration:")
+print(f"[CONFIG] - GEMINI_MODEL: {GEMINI_MODEL}")
+print(f"[CONFIG] - GEMINI_ENDPOINT: {GEMINI_ENDPOINT}")
+print(f"[CONFIG] - GEMINI_API_KEY present: {bool(GEMINI_API_KEY)} length={len(GEMINI_API_KEY) if GEMINI_API_KEY else 0}")
+if GEMINI_API_KEY:
+    print(f"[CONFIG] - GEMINI_API_KEY preview: {GEMINI_API_KEY[:4]}...{GEMINI_API_KEY[-4:]}")
+
+def _invoke_model(model_name: str, input_text: str, use_search_tools: bool = False):
+    """Invoke the configured model. First tries OpenAI, and if it fails, falls back to Gemini.
+    The returned object will be either the original SDK response or a lightweight dict with fields
+    compatible with the rest of this file (output_text, usage, model).
+    """
+    print(f"\n[DEBUG] Invoking model with:")
+    print(f"[DEBUG] - model_name: {model_name}")
+    print(f"[DEBUG] - input_text: {input_text[:200]}...")
+    print(f"[DEBUG] - use_search_tools: {use_search_tools}")
+
+    # Try OpenAI first
+    try:
+        print("[DEBUG] Attempting OpenAI API call...")
+        response = client.responses.create(
+            model=model_name,
+            input=input_text,
+            tools=[{"type": "web_search"}] if use_search_tools else None
+        )
+        print("[DEBUG] OpenAI API call successful")
+        return response
+    except Exception as e:
+        print(f"[WARNING] OpenAI API call failed: {str(e)}. Falling back to Gemini...")
+
+    # Gemini fallback path
+    if not GEMINI_ENDPOINT or not GEMINI_API_KEY:
+        raise RuntimeError('Gemini fallback failed: GEMINI_ENDPOINT or GEMINI_API_KEY not configured in .env')
+
+    print(f"[GEMINI FALLBACK] Using endpoint: {GEMINI_ENDPOINT}")
+    print(f"[GEMINI FALLBACK] Using model: {GEMINI_MODEL}")
+
+    # Use the exact same prompt as OpenAI to maintain consistency
+    gemini_prompt = f'''{input_text}'''
+
+    # Call Gemini API
+    headers = {
+        'Content-Type': 'application/json',
+        'X-goog-api-key': GEMINI_API_KEY
+    }
+
+    gemini_payload = {
+        "contents": [{"parts": [{"text": gemini_prompt}]}],
+        "generationConfig": {
+            "temperature": 0.7,
+            "topP": 0.95,
+            "topK": 40,
+            "maxOutputTokens": 2048
+        }
+    }
+
+    try:
+        resp = requests.post(GEMINI_ENDPOINT, headers=headers, json=gemini_payload, timeout=60)
+        resp_json = resp.json()
+    except Exception as e:
+        print(f"[GEMINI DEBUG] API call failed: {str(e)}")
+        raise RuntimeError("Failed to call Gemini API")
+
+    # Process Gemini response
+    if not resp_json.get('candidates'):
+        print("[GEMINI DEBUG] No candidates in response:", resp_json)
+        raise RuntimeError("No response candidates from Gemini")
+
+    content = resp_json['candidates'][0].get('content', {})
+    parts = content.get('parts', [])
+    
+    if not parts or 'text' not in parts[0]:
+        print("[GEMINI DEBUG] No text in response parts:", content)
+        raise RuntimeError("No text content in Gemini response")
+
+    raw_text = parts[0]['text']
+    print(f"[GEMINI DEBUG] Raw text response:\n{raw_text[:500]}")
+
+    def clean_and_parse_json(text: str) -> list:
+    """Parse JSON from potentially messy text."""
+    try:
+        print("[GEMINI DEBUG] Starting JSON parsing attempts...")
+        print(f"[GEMINI DEBUG] Original text: {text[:200]}")
+        
+        # Remove any markdown or formatting characters
+        text = text.strip()
+        text = re.sub(r'```json\s*|\s*```|`|#|\*|>', '', text)
+        
+        # Find complete JSON objects
+        objects = []
+        stack = []
+        start = -1
+        
+        for i, char in enumerate(text):
+            if char == '{':
+                if not stack:
+                    start = i
+                stack.append(char)
+            elif char == '}':
+                if stack:
+                    stack.pop()
+                    if not stack and start != -1:
+                        try:
+                            obj_text = text[start:i+1]
+                            obj = json.loads(obj_text)
+                            if all(k in obj for k in ["name", "phone", "details", "address", "location_note", "confidence"]):
+                                objects.append(obj)
+                        except json.JSONDecodeError:
+                            continue
+                        start = -1
+        
+        return objects
+    except Exception as e:
+        print(f"[GEMINI DEBUG] JSON parsing failed: {str(e)}")
+        return []
+                            continue
+                        start = -1
+                        
+        if objects:
+            print(f"[GEMINI DEBUG] Successfully parsed {len(objects)} complete objects")
+            return objects
+        
+        # Clean up the text
+        text = re.sub(r'[\r\n]+', ' ', text)  # Replace newlines with spaces
+        text = re.sub(r'\s+', ' ', text)      # Normalize whitespace
+        text = text.strip()
+        
+        print(f"[GEMINI DEBUG] Cleaned text: {text[:200]}")
+        
+        # First attempt: direct JSON parse
+        try:
+            parsed = json.loads(text)
+            print("[GEMINI DEBUG] Direct JSON parse succeeded")
+            return parsed if isinstance(parsed, list) else [parsed]
+        except json.JSONDecodeError as e:
+            print(f"[GEMINI DEBUG] Direct JSON parse failed: {str(e)}")
+
+        # Second attempt: Remove markdown code fences and try again
+        try:
+            # Remove ```json, ```, and any other markdown markers
+            cleaned = re.sub(r'```(?:json)?\s*|\s*```|`|#|\*|>', '', text)
+            # Ensure we have matching brackets
+            if cleaned.count('[') == cleaned.count(']') and cleaned.count('{') == cleaned.count('}'):
+                parsed = json.loads(cleaned)
+                print("[GEMINI DEBUG] Markdown cleanup parse succeeded")
+                return parsed if isinstance(parsed, list) else [parsed]
+        except json.JSONDecodeError as e:
+            print(f"[GEMINI DEBUG] Markdown cleanup parse failed: {str(e)}")
+
+        # Third attempt: Find and extract JSON array
+        try:
+            # Look for array pattern with nested objects
+            match = re.search(r'\[([\s\S]*?)\]', text)
+            if match:
+                array_content = match.group(1)
+                # Find complete JSON objects even in truncated responses
+            objects = []
+            stack = []
+            start = -1
+            
+            for i, char in enumerate(text):
+                if char == '{':
+                    if not stack:
+                        start = i
+                    stack.append(char)
+                elif char == '}':
+                    if stack:
+                        stack.pop()
+                        if not stack and start != -1:
+                            try:
+                                obj_text = text[start:i+1]
+                                obj = json.loads(obj_text)
+                                if 'name' in obj:  # At minimum we need a name
+                                    objects.append(obj)
+                            except json.JSONDecodeError:
+                                pass
+                            start = -1
+            
+            if objects:
+                print(f"[GEMINI DEBUG] Successfully extracted {len(objects)} complete objects")
+                return objects
+            
+            print("[GEMINI DEBUG] No complete objects found, attempting field-by-field parse...")
+
+        # Fourth attempt: Extract individual fields from key-value patterns
+        providers = []
+        provider = {}
+        
+        try:
+            # Look for all key-value pairs, handling both quoted and unquoted values
+            # Pattern for quoted values: "key": "value" or 'key': 'value'
+            quoted_pairs = re.finditer(r'["\']?(name|phone|details|address|location_note|confidence)["\']?\s*:\s*["\']([^"\']+)["\']', text)
+            
+            # Pattern for unquoted values: "key": value
+            unquoted_pairs = re.finditer(r'["\']?(name|phone|details|address|location_note|confidence)["\']?\s*:\s*([^,}\s][^,}]*)', text)
+            
+            # Combine all found fields
+            for match in quoted_pairs:
+                provider[match.group(1)] = match.group(2).strip()
+            for match in unquoted_pairs:
+                if match.group(1) not in provider:  # Don't override quoted values
+                    provider[match.group(1)] = match.group(2).strip()
+            
+            if provider and 'name' in provider:  # At minimum we need a name
+                print("[GEMINI DEBUG] Field-by-field extraction succeeded")
+                # Fill in missing fields with defaults
+                provider.setdefault('phone', 'XXX-XXX-XXXX')
+                provider.setdefault('details', 'No details available')
+                provider.setdefault('address', 'Address not provided')
+                provider.setdefault('location_note', 'NEARBY')
+                provider.setdefault('confidence', 'LOW')
+                providers = [provider]
+        except Exception as e:
+            print(f"[GEMINI DEBUG] Field extraction failed: {str(e)}")
+            print(f"[GEMINI DEBUG] Stack trace: {traceback.format_exc()}")
+            # Return an error provider
+            providers = [{
+                'name': 'Parsing Error',
+                'phone': 'XXX-XXX-XXXX',
+                'details': f'Failed to parse provider data. Error: {str(e)}',
+                'address': 'N/A',
+                'location_note': 'ERROR',
+                'confidence': 'LOW'
+            }]
+
+        # If we haven't found any providers yet, try one final attempt
+        if not providers:
+            try:
+                # More comprehensive business name pattern
+                business_patterns = [
+                    # Pattern 1: Explicit name field
+                    r'name["\']\s*:\s*["\']([^"\']+)["\']',
+                    # Pattern 2: Business-like names with common suffixes
+                    r'([A-Z][^\.!?]+(?:Services|Company|Inc|Ltd|LLC|Expert|Professional|Solution|Care|Center)s?)',
+                    # Pattern 3: Location-based business names
+                    r'([A-Z][^\.!?]+(?:of|in|at|from)\s+[A-Z][^\.!?]+)',
+                    # Pattern 4: Common business prefixes
+                    r'((?:The|A|Best|Professional|Expert|Local)\s+[A-Z][^\.!?]+)',
+                ]
+            
+                businesses = []
+                seen_names = set()
+                
+                for pattern in business_patterns:
+                    matches = re.finditer(pattern, text, re.IGNORECASE)
+                    for match in matches:
+                        name = match.group(1)
+                        if name and name.strip() not in seen_names:
+                            seen_names.add(name.strip())
+                            
+                            # Try to extract a phone number near this business name
+                            phone = "XXX-XXX-XXXX"
+                            phone_context = text[max(0, match.start() - 50):min(len(text), match.end() + 50)]
+                            phone_match = re.search(r'(\d{3}[-.]?\d{3}[-.]?\d{4})', phone_context)
+                            if phone_match:
+                                # Format the phone number consistently
+                                digits = re.sub(r'\D', '', phone_match.group(1))
+                                if len(digits) == 10:
+                                    phone = f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
+                            
+                            # Try to extract some details
+                            details = "Details unavailable"
+                            details_match = re.search(r'detail[s\"\':\s]+([^\"\'}\]]+)', text, re.IGNORECASE)
+                            if details_match:
+                                details = details_match.group(1).strip()
+                            
+                            # Try to extract address
+                            address = "Address not found"
+                            addr_match = re.search(r'address[\"\':\s]+([^\"\'}\]]+)', text, re.IGNORECASE)
+                            if addr_match:
+                                address = addr_match.group(1).strip()
+                            
+                            businesses.append({
+                                "name": name.strip(),
+                                "phone": phone,
+                                "details": details,
+                                "address": address,
+                                "location_note": "NEARBY",
+                                "confidence": "LOW"
+                            })
+                
+                if businesses:
+                    print(f"[GEMINI DEBUG] Salvaged {len(businesses)} business entries from text")
+                    return businesses
+                    
+            except Exception as e:
+                print(f"[GEMINI DEBUG] Final salvage attempt failed: {str(e)}")
+                print(f"[GEMINI DEBUG] Text sample: {text[:200]}")
+
+        # If we get here, create a single business entry with the raw text as details
+        return [{
+            "name": "Parsing Error",
+            "phone": "XXX-XXX-XXXX",
+            "details": f"Raw response: {text[:200]}...",
+            "address": "Parse error - see details",
+            "location_note": "ERROR",
+            "confidence": "LOW"
+        }]
+        
+        if not isinstance(providers_json, list):
+            providers_json = [providers_json] if isinstance(providers_json, dict) else []
+            
+            # If we haven't found any providers yet, try one last attempt at parsing JSON
+            if not providers:
+                try:
+                    # Parse and validate the response using our robust parser
+                    # First try to get complete objects from the raw text
+                    providers_json = []
+                    matches = re.finditer(r'\{[^}]*"name":[^}]+\}', raw_text)
+                    for match in matches:
+                        try:
+                            obj = json.loads(match.group(0))
+                            if 'name' in obj:  # At minimum we need a name
+                                # Create a normalized provider object
+                                provider = {
+                                    'name': obj.get('name', 'Unknown Business'),
+                                    'phone': obj.get('phone', 'XXX-XXX-XXXX'),
+                                    'details': obj.get('details', 'No details available'),
+                                    'address': obj.get('address', 'Address not provided'),
+                                    'location_note': obj.get('location_note', 'NEARBY'),
+                                    'confidence': obj.get('confidence', 'LOW')
+                                }
+                                providers.append(provider)
+                        except json.JSONDecodeError:
+                            print(f"[DEBUG] Failed to parse JSON object: {match.group(0)[:100]}")
+                            continue
+                        except Exception as e:
+                            print(f"[DEBUG] Error processing provider: {str(e)}")
+                            continue            # Format phone number if needed
+            if not re.match(r'\d{3}-\d{3}-\d{4}', normalized['phone']):
+                digits = re.findall(r'\d', normalized['phone'])
+                if len(digits) >= 10:
+                    normalized['phone'] = f"{digits[0:3]}-{digits[3:6]}-{digits[6:10]}"
+                else:
+                    normalized['phone'] = 'XXX-XXX-XXXX'
+                    
+            normalized_providers.append(normalized)
+
+        # Return in expected format
+        return type('GeminiResponse', (), {
+            'output_text': json.dumps(normalized_providers),
+            'model': GEMINI_MODEL,
+            'usage': resp_json.get('usageMetadata', {})
+        })
+    except json.JSONDecodeError as e:
+        print(f"[GEMINI DEBUG] Failed to parse JSON: {str(e)}")
+        print(f"[GEMINI DEBUG] Raw text: {parts[0]['text'][:500]}")
+        raise RuntimeError("Failed to parse Gemini response as JSON")
+
+        # Validate and normalize each provider entry
+        for provider in providers_json:
+            if not isinstance(provider, dict):
+                continue
+            # Ensure all required fields exist with proper formatting
+            provider['name'] = provider.get('name', 'Unknown Business')
+            provider['phone'] = provider.get('phone', 'No phone available')
+            if not re.match(r'\d{3}-\d{3}-\d{4}', provider['phone']):
+                provider['phone'] = 'XXX-XXX-XXXX'
+            provider['details'] = provider.get('details', 'No details available')
+            provider['address'] = provider.get('address', 'Address not provided')
+            provider['location_note'] = provider.get('location_note', 'NEARBY')
+            provider['confidence'] = provider.get('confidence', 'LOW')
+
+        # Return a response object that matches the expected format
+        return type('GeminiResponse', (), {
+            'output_text': json.dumps(providers_json),
+            'model': GEMINI_MODEL,
+            'usage': resp_json.get('usageMetadata', {})
+        })
+    except json.JSONDecodeError as e:
+        print(f"[GEMINI DEBUG] Failed to parse providers JSON: {str(e)}")
+        print(f"[GEMINI DEBUG] Raw response text: {parts[0]['text'][:500]}")
+        raise RuntimeError("Failed to parse Gemini response as JSON")
+import json
+from config import client
+import os
+import requests
+import traceback
+from dotenv import load_dotenv
+from routes.auth_routes import router as auth_router
+
+# Load environment variables from .env file (force override to avoid truncated pre-set vars)
+load_dotenv(override=True)
+
+app = FastAPI(title="ServiceGPT API", version="1.0.0")
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://localhost:8000"],  # Frontend URLs
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["*"]
+)
+
+# Import and add security headers middleware
+from middleware.security import SecurityHeadersMiddleware
+app.add_middleware(SecurityHeadersMiddleware)
+
+# Mount the auth routes
+app.include_router(auth_router, prefix="/api")
+
+# --- Model Configuration -------------------------------------------------------
+# Load Gemini configuration for fallback
+GEMINI_API_KEY = (os.getenv('GEMINI_API_KEY', '') or '').strip()
+GEMINI_MODEL = (os.getenv('GEMINI_MODEL', 'gemini-2.0-flash') or 'gemini-2.0-flash').strip()
+GEMINI_ENDPOINT = (os.getenv('GEMINI_ENDPOINT', '') or '').strip()
+
+# If no endpoint is specified, construct it from the model name
+if not GEMINI_ENDPOINT and GEMINI_MODEL:
+    GEMINI_ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+
+# Debug: Print current configuration
+print(f"[CONFIG] OpenAI API KEY present: {bool(client.api_key)}")
+print(f"[CONFIG] Gemini Fallback Configuration:")
+print(f"[CONFIG] - GEMINI_MODEL: {GEMINI_MODEL}")
+print(f"[CONFIG] - GEMINI_ENDPOINT: {GEMINI_ENDPOINT}")
+print(f"[CONFIG] - GEMINI_API_KEY present: {bool(GEMINI_API_KEY)} length={len(GEMINI_API_KEY) if GEMINI_API_KEY else 0}")
+if GEMINI_API_KEY:
+    print(f"[CONFIG] - GEMINI_API_KEY preview: {GEMINI_API_KEY[:4]}...{GEMINI_API_KEY[-4:]}")
+# ---------------------------------------------------------------------------------
+
+
+def _invoke_model(model_name: str, input_text: str, use_search_tools: bool = False):
+    """Invoke the configured model. First tries OpenAI, and if it fails, falls back to Gemini.
+    The returned object will be either the original SDK response or a lightweight dict with fields
+    compatible with the rest of this file (output_text, usage, model).
+    """
+    print(f"\n[DEBUG] Invoking model with:")
+    print(f"[DEBUG] - model_name: {model_name}")
+    print(f"[DEBUG] - input_text: {input_text[:200]}...")
+    print(f"[DEBUG] - use_search_tools: {use_search_tools}")
+    # Try OpenAI first
+    try:
+        print("[DEBUG] Attempting OpenAI API call...")
+        response = client.responses.create(
+            model=model_name,
+            input=input_text,
+            tools=[{"type": "web_search"}] if use_search_tools else None
+        )
+        print("[DEBUG] OpenAI API call successful")
+        return response
+    except Exception as e:
+        print(f"[WARNING] OpenAI API call failed: {str(e)}. Falling back to Gemini...")
+
+    # Gemini fallback path: use HTTP POST to GEMINI_ENDPOINT
+    if not GEMINI_ENDPOINT or not GEMINI_API_KEY:
+        raise RuntimeError('Gemini fallback failed: GEMINI_ENDPOINT or GEMINI_API_KEY not configured in .env')
+    # Gemini expects X-goog-api-key header and a contents/parts body per docs
+    headers = {
+        'Content-Type': 'application/json',
+        'X-goog-api-key': GEMINI_API_KEY
+    }
+
+    print(f"[GEMINI FALLBACK] Using endpoint: {GEMINI_ENDPOINT}")
+    print(f"[GEMINI FALLBACK] Using model: {GEMINI_MODEL}")
+
+    # Build the request body for Gemini API
+    # Enhance the prompt for Gemini to ensure consistent output format
+    gemini_prompt = f"""You MUST return a valid JSON array of service providers. Each provider MUST include ALL these fields:
+- name (business name)
+- phone (valid phone number in format XXX-XXX-XXXX)
+- details (brief description)
+- address (full address)
+- location_note (either "EXACT" or "NEARBY")
+- confidence (either "HIGH" or "LOW")
+
+Original query:
+{input_text}
+
+Return ONLY the JSON array, no other text. Example format:
+[
+  {{
+    "name": "Example Business",
+    "phone": "555-555-5555",
+    "details": "Service description",
+    "address": "123 Main St, City, State",
+    "location_note": "EXACT",
+    "confidence": "HIGH"
+  }}
+]"""
+
+    gemini_payload = {
+        "contents": [{"parts": [{"text": gemini_prompt}]}],
+        "generationConfig": {
+            "temperature": 0.7,
+            "topP": 0.8,
+            "topK": 40,
+            "maxOutputTokens": 2048,
+        }
+    }
+
+    # Use GEMINI_MODEL via endpoint URL
+    resp = requests.post(GEMINI_ENDPOINT, headers=headers, json=gemini_payload, timeout=60)
+    try:
+        resp_json = resp.json()
+    except Exception as e:
+        print(f"[GEMINI DEBUG] Failed to parse response as JSON: {str(e)}")
+        raise RuntimeError("Invalid response from Gemini API")
+
+    # Extract the text from Gemini's response
+    if 'candidates' in resp_json and resp_json['candidates']:
+        content = resp_json['candidates'][0].get('content', {})
+        parts = content.get('parts', [])
+        if parts and 'text' in parts[0]:
+            raw_text = parts[0]['text']
+            try:
+                providers_json = json.loads(raw_text)
+                if isinstance(providers_json, list):
+                    # Validate and fix each provider entry
+                    normalized_providers = []
+                    for provider in providers_json:
+                        if not isinstance(provider, dict):
+                            continue
+                        
+                        # Extract phone number if embedded in details or other fields
+                        phone = provider.get('phone', '')
+                        if not re.match(r'\d{3}-\d{3}-\d{4}', str(phone)):
+                            # Try to find phone number in other fields
+                            all_text = ' '.join(str(v) for v in provider.values())
+                            phone_matches = re.findall(r'(?:[\+]?(\d{1,3}))?[-\s\.]?(\d{3})[-\s\.]?(\d{3})[-\s\.]?(\d{4})', all_text)
+                            if phone_matches:
+                                # Format the first found phone number
+                                nums = ''.join(phone_matches[0])[-10:]  # Get last 10 digits
+                                phone = f"{nums[:3]}-{nums[3:6]}-{nums[6:]}"
+                        
+                        # Create normalized provider entry
+                        normalized_provider = {
+                            'name': str(provider.get('name', 'Unknown Business')).strip(),
+                            'phone': phone if phone and re.match(r'\d{3}-\d{3}-\d{4}', phone) else 'XXX-XXX-XXXX',
+                            'details': str(provider.get('details', 'No details available')).strip(),
+                            'address': str(provider.get('address', 'Address not provided')).strip(),
+                            'location_note': str(provider.get('location_note', 'NEARBY')).upper(),
+                            'confidence': str(provider.get('confidence', 'LOW')).upper()
+                        }
+                        
+                        # Validate required fields
+                        if normalized_provider['name'] != 'Unknown Business':
+                            normalized_providers.append(normalized_provider)
+                    
+                    if not normalized_providers:
+                        print("[GEMINI DEBUG] No valid providers found after normalization")
+                        # Create a fallback provider with the raw text
+                        normalized_providers = [{
+                            'name': 'Response Error',
+                            'phone': 'XXX-XXX-XXXX',
+                            'details': f'Failed to parse provider data. Raw response: {raw_text[:200]}...',
+                            'address': 'N/A',
+                            'location_note': 'ERROR',
+                            'confidence': 'LOW'
+                        }]
+                    
+                    # Create a response object that matches the OpenAI format
+                    return type('GeminiResponse', (), {
+                        'output_text': json.dumps(normalized_providers),
+                        'model': GEMINI_MODEL,
+                        'usage': resp_json.get('usageMetadata', {})
+                    })
+            except json.JSONDecodeError as e:
+                print(f"[GEMINI DEBUG] Failed to parse providers JSON from response: {str(e)}")
+                print(f"[GEMINI DEBUG] Raw text: {raw_text[:500]}")
+                # Instead of failing, return a formatted error response
+                error_provider = [{
+                    'name': 'JSON Parse Error',
+                    'phone': 'XXX-XXX-XXXX',
+                    'details': f'Failed to parse JSON response. Error: {str(e)}. Raw text: {raw_text[:200]}...',
+                    'address': 'N/A',
+                    'location_note': 'ERROR',
+                    'confidence': 'LOW'
+                }]
+                return type('GeminiResponse', (), {
+                    'output_text': json.dumps(error_provider),
+                    'model': GEMINI_MODEL,
+                    'usage': {}
+                })
+
+
+
+# Helpers: robustly extract text and usage from varying SDK shapes
+def _get_response_text(resp):
+    try:
+        text = getattr(resp, 'output_text', None)
+        if text:
+            return text
+        out = getattr(resp, 'output', None)
+        if isinstance(out, list) and len(out) > 0:
+            first = out[0]
+            if isinstance(first, dict):
+                # try find common nested fields
+                content = first.get('content')
+                if isinstance(content, list) and len(content) > 0 and isinstance(content[0], dict):
+                    return content[0].get('text') or content[0].get('content') or json.dumps(content)
+                return first.get('text') or json.dumps(first)
+        # fallback to string
+        return str(resp)
+    except Exception:
+        return ''
+
+
+def _get_usage_info(resp):
+    try:
+        u = getattr(resp, 'usage', None)
+        # try dict-like access
+        if u is None and isinstance(resp, dict):
+            u = resp.get('usage')
+        if not u:
+            return {}
+
+        def _g(o, *names):
+            for n in names:
+                if isinstance(o, dict) and n in o:
+                    return o[n]
+                if hasattr(o, n):
+                    return getattr(o, n)
+            return 0
+
+        input_tokens = _g(u, 'input_tokens', 'prompt_tokens') or 0
+        output_tokens = _g(u, 'output_tokens', 'completion_tokens') or 0
+        total_tokens = (input_tokens or 0) + (output_tokens or 0)
+        return {
+            'model': getattr(resp, 'model', None) or (resp.get('model') if isinstance(resp, dict) else None),
+            'input_tokens': input_tokens,
+            'output_tokens': output_tokens,
+            'total_tokens': total_tokens
+        }
+    except Exception:
+        return {}
+
+
+# Enable CORS for frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://localhost:5173", "http://localhost:5174"],  # React dev servers
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class ChatRequest(BaseModel):
+    service: str
+    location: str
+    count: int = 3
+    existing: list[str] = []  # optional list of already shown provider names for load-more
+
+class NlpRequest(BaseModel):
+    query: str
+
+class ChatResponse(BaseModel):
+    providers: list
+    usage_report: dict
+
+class NlpResponse(BaseModel):
+    valid: bool
+    providers: list = []
+    usage_report: dict = {}
+
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat_endpoint(request: ChatRequest):
+    """Process chat requests and return business providers."""
+    try:
+        # Initialize response and providers list
+        response = None
+        found_providers = []
+        
+        print(f"\n[DEBUG] Processing request for {request.service} in {request.location}")
+        print(f"[DEBUG] Requesting {request.count} providers, existing count: {len(request.existing)}")
+        
+        # Try to invoke the model to get providers
+        try:
+            response = _invoke_model("gpt-4o", prompt, use_search_tools=True)
+            if response:
+                text = _get_response_text(response)
+                
+                # Clean and parse the response
+                text = re.sub(r'```json\s*|\s*```|`', '', text.strip())
+                
+                # Parse JSON objects from the response text
+                try:
+                    # First try direct JSON parsing
+                    providers_json = json.loads(text)
+                    if isinstance(providers_json, dict):
+                        providers_json = [providers_json]
+                    elif not isinstance(providers_json, list):
+                        providers_json = []
+                        
+                except json.JSONDecodeError:
+                    # If that fails, try to extract complete objects
+                    providers_json = []
+                    stack = []
+                    start = -1
+                    
+                    for i, char in enumerate(text):
+                        if char == '{':
+                            if not stack:
+                                start = i
+                            stack.append(char)
+                        elif char == '}':
+                            if stack:
+                                stack.pop()
+                                if not stack and start != -1:
+                                    try:
+                                        obj_text = text[start:i+1]
+                                        provider = json.loads(obj_text)
+                                        if provider.get('name'):  # At minimum we need a name
+                                            providers_json.append(provider)
+                                    except json.JSONDecodeError:
+                                        continue
+                                    start = -1
+                
+                # Process and normalize all found providers
+                for provider in providers_json:
+                    if not isinstance(provider, dict) or 'name' not in provider:
+                        continue
+                        
+                    # Create normalized provider entry
+                    normalized = {
+                        'name': provider.get('name', 'Unknown'),
+                        'phone': provider.get('phone', 'XXX-XXX-XXXX'),
+                        'details': provider.get('details', 'No details available'),
+                        'address': provider.get('address', 'Address not provided'),
+                        'location_note': provider.get('location_note', 'NEARBY'),
+                        'confidence': provider.get('confidence', 'LOW')
+                    }
+                    
+                    # Format phone number if needed
+                    if not re.match(r'\d{3}-\d{3}-\d{4}', normalized['phone']):
+                        digits = re.findall(r'\d', normalized['phone'])
+                        if len(digits) >= 10:
+                            normalized['phone'] = f"{digits[0:3]}-{digits[3:6]}-{digits[6:10]}"
+                    
+                    found_providers.append(normalized)
+                
+                # Filter out any providers already shown
+                existing_names = set(request.existing)
+                providers = [p for p in found_providers if p['name'] not in existing_names]
+                
+                # Get usage info
+                usage_info = _get_usage_info(response)
+                
+                # Return the results
+                return {
+                    "providers": providers,
+                    "usage_report": usage_info
+                }
+                
+        except Exception as e:
+            print(f"[ERROR] Error processing providers: {str(e)}")
+            # Continue with whatever providers we found (if any)
+                                        found_providers.append(provider)
+                                except json.JSONDecodeError:
+                                    continue
+                                start = -1
+                                
+        except Exception as e:
+            print(f"[WARNING] Error in chat processing: {str(e)}")
+            # Continue with whatever providers we found (if any)
+                                
+                print(f"[DEBUG] Successfully parsed {len(found_providers)} providers from response")
+
+        # Process results
+        try:
+            # Filter out any existing providers
+            existing_names = set(request.existing)
+            providers = [p for p in found_providers if p['name'] not in existing_names]
+            
+            # Get usage info if available
+            usage_info = _get_usage_info(response) if response else {}
+            
+            return {
+                "providers": providers,
+                "usage_report": usage_info
+            }
+            
+        # Process results and handle top-up if needed
+        try:
+            # Filter out duplicates and format results
+            found_providers = found_providers or []  # Ensure we have a list
+            providers = []
+            seen_names = {name.lower().strip() for name in (request.existing or [])}
+            
+            for p in found_providers:
+                if not isinstance(p, dict) or not p.get('name'):
+                    continue
+                name = p['name'].lower().strip()
+                if name not in seen_names:
+                    providers.append(p)
+                    seen_names.add(name)
+            
+            # Get usage info
+            usage_info = _get_usage_info(response) if response else {}
+            
+            # Return the results
+            return {
+                "providers": providers[:request.count],  # Limit to requested count
+                "usage_report": usage_info
+            }
+            
+        except Exception as e:
+            print(f"[ERROR] Error in final processing: {str(e)}")
+            return {
+                "providers": [],
+                "usage_report": {}
+            }
+
+    except Exception as e:
+        print(f"[ERROR] Unhandled error in chat endpoint: {str(e)}")
+        return {
+            "providers": [],
+            "usage_report": {}
+        }
+"""
+            try:
+                add_resp = _invoke_model("gpt-4o", top_up_prompt, use_search_tools=True)
+                add_text = _get_response_text(add_resp)
+                print(f"[TOP-UP] attempt={attempts} remaining={remaining} raw_length={len(add_text)}")
+                extra = _parse_providers(add_text)
+                if isinstance(extra, list):
+                    new_items = []
+                    for p in extra:
+                        if not isinstance(p, dict):
+                            continue
+                        nm = (p.get('name') or '').strip().lower()
+                        if not nm or nm in seen:
+                            continue
+                        new_items.append(p)
+                        seen.add(nm)
+                    if new_items:
+                        print(f"[TOP-UP] attempt={attempts} accepted_new={len(new_items)} total_before={len(providers)}")
+                        providers.extend(new_items)
+                        print(f"[TOP-UP] total_after={len(providers)}")
+                else:
+                    print('[TOP-UP] parse failed (attempt', attempts, ') raw:', add_text[:200])
+            except Exception as tu_err:
+                print('[TOP-UP] attempt failed:', tu_err)
+                break
+        # Trim to requested count
+        if isinstance(providers, list) and len(providers) > request.count:
+            providers = providers[:request.count]
+        # --- end unified top-up ----------------------------------------------------
+
+        # Gather usage info (outside top-up block)
+        usage_info = _get_usage_info(response)
+        print(f"[CHAT DEBUG] providers_final_count={len(providers) if isinstance(providers, list) else 'N/A'} input_tokens={usage_info.get('input_tokens', 0)} output_tokens={usage_info.get('output_tokens', 0)}")
+        input_tokens = usage_info.get('input_tokens', 0) or 0
+        output_tokens = usage_info.get('output_tokens', 0) or 0
+        total_tokens = usage_info.get('total_tokens', input_tokens + output_tokens)
+
+        # Pricing for gpt-4o
+        input_cost_per_1k = 0.005
+        output_cost_per_1k = 0.015
+        cost = (input_tokens / 1000 * input_cost_per_1k) + (output_tokens / 1000 * output_cost_per_1k)
+
+        usage_report = {
+            "model": usage_info.get('model') or getattr(response, 'model', None),
+            "input_tokens": int(input_tokens),
+            "output_tokens": int(output_tokens),
+            "total_tokens": int(total_tokens),
+            "estimated_cost_usd": round(cost, 6)
+        }
+
+        try:
+            return ChatResponse(providers=providers, usage_report=usage_report)
+        except Exception as build_err:
+            print('[CHAT DEBUG] Failed constructing ChatResponse:', build_err)
+            print('[CHAT DEBUG] providers sample:', providers[:2] if isinstance(providers, list) else providers)
+            print('[CHAT DEBUG] usage_report:', usage_report)
+            raise HTTPException(status_code=500, detail='Result formatting failure')
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+                        p['phone'] = f"{digits[0:3]}-{digits[3:6]}-{digits[6:10]}"
+            
+            # Get usage info if available
+            usage_info = _get_usage_info(response) if response else {}
+            
+            return {
+                "providers": providers,
+                "usage_report": usage_info
+            }
+            
+        except Exception as e:
+            print(f"[ERROR] Error in final processing: {str(e)}")
+            return {
+                "providers": [],
+                "usage_report": {}
+            }
+
+@app.post("/api/nlp", response_model=NlpResponse)
+async def nlp_endpoint(request: NlpRequest):
+    """Process natural language queries to find service providers."""
+    if not request or not request.query:
+        return NlpResponse(valid=False)
+
+    try:
+        # First, validate if the query is service-related
+        validation_prompt = (
+            f'Analyze this query: "{request.query}"\n\n'
+            'Is this query asking for local service providers like electricians, plumbers, handymen, '
+            'cleaners, mechanics, barbers, or similar home/personal services?\n\n'
+            'Return ONLY "VALID" or "INVALID" - nothing else.\n\n'
+            'Examples of VALID queries:\n'
+            '- "I need an electrician to fix my wiring"\n'
+            '- "Looking for a plumber in Chicago"\n'
+            '- "Find me a handyman near me"\n'
+            '- "I need a mechanic for car repair"\n'
+            '- "Looking for house cleaning services"\n'
+            '- "Need a barber for haircut"\n\n'
+            'Examples of INVALID queries:\n'
+            '- "What\'s the weather like?"\n'
+            '- "How to cook pasta?"\n'
+            '- "Tell me about artificial intelligence"\n'
+            '- "What\'s 2+2?"\n'
+            '- "Book a flight to New York"\n'
+        )
+
+        # Validate query
+        try:
+            validation_response = _invoke_model("gpt-4o", validation_prompt, use_search_tools=False)
+            if not validation_response:
+                print("[ERROR] Validation response is empty")
+                return NlpResponse(valid=False)
+
+            # Check if the query is valid
+            text = _get_response_text(validation_response).strip().upper()
+            if "VALID" not in text:
+                print(f"[INFO] Query marked as invalid: {request.query}")
+                return NlpResponse(valid=False)
+            
+            # Query is valid, prepare to extract service info
+            try:
+                # Query for providers
+                response = _invoke_model("gpt-4o", extraction_prompt, use_search_tools=True)
+                text = _get_response_text(response)
+                
+            # Extract service info and find providers
+            extraction_prompt = (
+                f'From this service request: "{request.query}"\n\n'
+                'Extract the service type, location, and find relevant providers (default 3).\n\n'
+                'Use web search to find REAL service providers. Return ONLY valid JSON:\n'
+                '{\n'
+                '  "service": "extracted service type",\n'
+                '  "location": "extracted location or \'not specified\'",\n'
+                '  "count": 3,\n'
+                '  "providers": [\n'
+                '    {\n'
+                '      "name": "real business name",\n'
+                '      "phone": "XXX-XXX-XXXX format",\n'
+                '      "details": "brief description",\n'
+                '      "address": "full address",\n'
+                '      "location_note": "EXACT or NEARBY",\n'
+                '      "confidence": "HIGH or LOW"\n'
+                '    }\n'
+                '  ]\n'
+                '}\n\n'
+                'Guidelines:\n'
+                '- Search in provided location first\n'
+                '- If no location specified, search broadly\n'
+                '- Include country-specific results for non-US locations\n'
+                '- Phone numbers must match XXX-XXX-XXXX format\n'
+                '- Return clean JSON only, no commentary'
+            )
+
+            try:
+                # Query for providers
+                response = _invoke_model("gpt-4o", extraction_prompt, use_search_tools=True)
+                if not response:
+                    print("[ERROR] Empty provider lookup response")
+                    return NlpResponse(valid=False)
+
+                text = _get_response_text(response)
+                if not text:
+                    print("[ERROR] Empty provider lookup text")
+                    return NlpResponse(valid=False)
+
+                try:
+                    # Clean and parse the response
+                    text = re.sub(r'```json\s*|\s*```|`', '', text.strip())
+                    data = json.loads(text)
+                    
+                    # Validate and normalize providers
+                    providers = data.get("providers", [])
+                    normalized_providers = []
+                    
+                    for provider in providers:
+                        if not isinstance(provider, dict) or not provider.get('name'):
+                            continue
+                            
+                        # Normalize phone format
+                        phone = provider.get('phone', '')
+                        if not re.match(r'\d{3}-\d{3}-\d{4}', str(phone)):
+                            digits = re.findall(r'\d', str(phone))
+                            phone = 'XXX-XXX-XXXX' if len(digits) < 10 else f"{digits[:3]}-{digits[3:6]}-{digits[6:10]}"
+                        
+                        # Create normalized provider
+                        normalized = {
+                            'name': str(provider.get('name', '')).strip(),
+                            'phone': phone,
+                            'details': str(provider.get('details', 'No details available')).strip(),
+                            'address': str(provider.get('address', 'Address not provided')).strip(),
+                            'location_note': str(provider.get('location_note', 'NEARBY')).upper(),
+                            'confidence': str(provider.get('confidence', 'LOW')).upper()
+                        }
+                        
+                        if normalized['name']:  # Only include if we have a name
+                            normalized_providers.append(normalized)
+                    
+                    # Get usage info
+                    usage_info = _get_usage_info(response)
+                    
+                    # Calculate costs
+                    input_tokens = usage_info.get('input_tokens', 0) or 0
+                    output_tokens = usage_info.get('output_tokens', 0) or 0
+                    total_tokens = usage_info.get('total_tokens', input_tokens + output_tokens)
+                    
+                    cost = (input_tokens / 1000 * 0.005) + (output_tokens / 1000 * 0.015)  # GPT-4 pricing
+                    
+                    usage_report = {
+                        "model": usage_info.get('model') or getattr(response, 'model', None),
+                        "input_tokens": int(input_tokens),
+                        "output_tokens": int(output_tokens),
+                        "total_tokens": int(total_tokens),
+                        "estimated_cost_usd": round(cost, 6)
+                    }
+                    
+                    return NlpResponse(
+                        valid=True,
+                        providers=normalized_providers,
+                        usage_report=usage_report
+                    )                except json.JSONDecodeError:
+                    print(f"[ERROR] Failed to parse JSON response: {text[:200]}")
+                    return NlpResponse(valid=False)
+                    
+            except Exception as e:
+                print(f"[ERROR] Provider lookup failed: {str(e)}")
+                return NlpResponse(valid=False)
+            try:
+                return getattr(resp, 'output_text', '') or ''
+            except Exception:
+                return ''
+
+        is_valid = "VALID" in (_get_text(validation_response) or '').upper()
+
+        if not is_valid:
+            return NlpResponse(valid=False)
+
+        # If valid, extract service info and find providers
+        extraction_query = f"""
+From this service request: "{request.query}"
+
+Extract the service type, location, and determine a reasonable number of providers (default 3).
+
+Then find providers using web search. Return ONLY valid JSON in this format:
+
+{{
+  "service": "extracted service type",
+  "location": "extracted location or 'not specified'", 
+  "count": 3,
+  "providers": [
+    {{
+      "name": "...",
+      "phone": "...",
+      "details": "...",
+      "address": "...",
+      "location_note": "EXACT or NEARBY",
+      "confidence": "HIGH or LOW"
+    }}
+  ]
+}}
+
+If location is not specified or unclear, search broadly in major cities worldwide.
+When searching for services, prioritize local providers from the specified country/region.
+For international locations outside the US, include country-specific service providers and local businesses.
+No extra commentary, only JSON.
+"""
+
+        # Call model with OpenAI, falling back to Gemini if needed
+        try:
+            response = _invoke_model("gpt-4o", extraction_query, use_search_tools=True)
+        except Exception as e:
+            tb = traceback.format_exc()
+            print("NLP extraction request failed:", e)
+            print(tb)
+            raise HTTPException(status_code=500, detail=f"NLP extraction failed: {str(e)}")
+
+        raw_text = _get_response_text(response)
+        try:
+            data = json.loads(raw_text)
+            providers = data.get("providers", [])
+        except Exception:
+            providers = []
+
+        usage_info = _get_usage_info(response)
+        input_tokens = usage_info.get('input_tokens', 0) or 0
+        output_tokens = usage_info.get('output_tokens', 0) or 0
+        total_tokens = usage_info.get('total_tokens', input_tokens + output_tokens)
+
+        # Pricing for gpt-4o
+        input_cost_per_1k = 0.005
+        output_cost_per_1k = 0.015
+        cost = (input_tokens / 1000 * input_cost_per_1k) + (output_tokens / 1000 * output_cost_per_1k)
+
+        usage_report = {
+            "model": usage_info.get('model') or getattr(response, 'model', None),
+            "input_tokens": int(input_tokens),
+            "output_tokens": int(output_tokens),
+            "total_tokens": int(total_tokens),
+            "estimated_cost_usd": round(cost, 6)
+        }
+
+        return NlpResponse(valid=True, providers=providers, usage_report=usage_report)
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/health")
+async def health_check():
+    """Basic health check endpoint."""
+    try:
+        # Test that both models are available
+        openai_available = bool(client.api_key)
+        gemini_available = bool(GEMINI_API_KEY and GEMINI_ENDPOINT)
+        
+        return {
+            "status": "healthy",
+            "message": "ServiceGPT API is running",
+            "models": {
+                "openai": "available" if openai_available else "unavailable",
+                "gemini": "available" if gemini_available else "unavailable"
+            }
+        }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "message": str(e)
+        }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)

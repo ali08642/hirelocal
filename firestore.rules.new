@@ -1,0 +1,33 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper function to check if user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    // Helper function to check if user is accessing their own data
+    function isUser(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Match users collection and its documents
+    match /users/{userId} {
+      // Allow users to read and write their own documents
+      allow read, write: if isUser(userId);
+      
+      // Match savedBusinesses subcollection
+      match /savedBusinesses/{businessId} {
+        allow read, write: if isUser(userId);
+      }
+    }
+    
+    // Match businesses collection (if you have one for public data)
+    match /businesses/{businessId} {
+      // Anyone can read public business data
+      allow read: if isAuthenticated();
+      // Only authenticated users can create/update businesses
+      allow write: if isAuthenticated();
+    }
+  }
+}
